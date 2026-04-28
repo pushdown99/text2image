@@ -74,6 +74,7 @@ WORKSPACE_DIR = AI_DIR.parent
 OUTPUTS_DIR = AI_DIR / 'outputs'
 CODEX_LOGS_DIR = OUTPUTS_DIR / '_codex_logs'
 CODEX_BIN_CANDIDATES = ['codex', '/opt/homebrew/bin/codex']
+CODEX_HOME_IMAGES_DIR = Path.home() / '.codex' / 'generated_images'
 
 
 def get_pipe(engine: str):
@@ -180,20 +181,37 @@ def _acquire_generation_lock():
         )
 
 
-def _recover_codex_temp_output(target: Path, started_at: float) -> bool:
+def _collect_recent_codex_images(started_at: float):
     candidates = []
-    for path in Path('/var/folders').glob('*/*/*/T/ig_*.png'):
-        try:
-            stat = path.stat()
-        except FileNotFoundError:
-            continue
-        if stat.st_mtime >= started_at - 2 and stat.st_size > 0:
-            candidates.append((stat.st_mtime, path))
 
+    if CODEX_HOME_IMAGES_DIR.exists():
+        for path in CODEX_HOME_IMAGES_DIR.rglob('ig_*.png'):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if stat.st_mtime >= started_at - 5 and stat.st_size > 0:
+                candidates.append((stat.st_mtime, path))
+
+    var_folders = Path('/var/folders')
+    if var_folders.exists():
+        for path in var_folders.glob('*/*/*/T/ig_*.png'):
+            try:
+                stat = path.stat()
+            except (FileNotFoundError, PermissionError):
+                continue
+            if stat.st_mtime >= started_at - 5 and stat.st_size > 0:
+                candidates.append((stat.st_mtime, path))
+
+    return sorted(candidates, key=lambda item: item[0])
+
+
+def _recover_codex_temp_output(target: Path, started_at: float) -> bool:
+    candidates = _collect_recent_codex_images(started_at)
     if not candidates:
         return False
 
-    _, latest = max(candidates, key=lambda item: item[0])
+    _, latest = candidates[-1]
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(latest, target)
     return target.exists() and target.stat().st_size > 0
