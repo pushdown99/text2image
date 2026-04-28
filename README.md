@@ -177,6 +177,66 @@ FLUX 라이선스 동의 완료: https://huggingface.co/black-forest-labs/FLUX.1
 
 ---
 
+## IMSenz AI Studio API
+
+`server.py`는 Mac mini에서 돌아가는 FastAPI 기반 이미지 생성 서버입니다.
+
+### 엔드포인트
+- `GET /health` — 서버 상태, 로드된 엔진 확인
+- `GET /presets` — 품질 preset 확인
+- `POST /generate` — JSON 메타데이터 + 선택적 base64 응답
+- `POST /generate/raw` — PNG 바이너리 직접 응답
+- `GET /files/{file_id}` — 저장된 PNG 다운로드
+- `POST /unload?engine=turbo|base` — 메모리에서 엔진 unload
+
+### `POST /generate` 요청 예시
+
+```json
+{
+  "prompt": "a simple teal gradient background",
+  "negative": "blurry, low quality, text, watermark",
+  "quality": "draft",
+  "width": 512,
+  "height": 512,
+  "filename": "teal-gradient.png",
+  "include_base64": false
+}
+```
+
+### `POST /generate` 응답 예시
+
+```json
+{
+  "ok": true,
+  "elapsed_sec": 8.19,
+  "meta": {
+    "engine": "turbo",
+    "steps": 4,
+    "width": 512,
+    "height": 512,
+    "guidance": 0.0,
+    "quality": "draft"
+  },
+  "file_id": "img_20260428_145243_f1b46d2c",
+  "filename": "teal-gradient.png",
+  "relative_path": "2026/04/28/img_20260428_145243_f1b46d2c__teal-gradient.png",
+  "download_url": "http://<host>:7860/files/img_20260428_145243_f1b46d2c",
+  "bytes": 252452
+}
+```
+
+### 저장 정책
+- 외부 API는 `save_path`를 받지 않음
+- 호출자는 `filename`만 지정 가능
+- 실제 파일은 서버가 내부적으로 유니크한 `file_id`를 붙여 저장
+- 저장 경로 패턴:
+  - `outputs/YYYY/MM/DD/<file_id>__<filename>.png`
+
+### 운영 메모
+- 생성은 MPS 안정성을 위해 직렬화됨
+- 동시 요청이 겹치면 빠르게 `503 generator busy`를 반환
+- `draft/turbo`는 빠른 초안용, `balanced/base` 이상은 시간이 오래 걸림
+
 ## Codex CLI 향후 기능 (under development)
 
 - image_generation: 켜지면 CLI에서 이미지 생성
