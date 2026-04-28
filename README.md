@@ -182,8 +182,8 @@ FLUX 라이선스 동의 완료: https://huggingface.co/black-forest-labs/FLUX.1
 `server.py`는 Mac mini에서 돌아가는 FastAPI 기반 이미지 생성 서버입니다.
 
 ### 엔드포인트
-- `GET /health` — 서버 상태, 로드된 엔진 확인
-- `GET /presets` — 품질 preset 확인
+- `GET /health` — 서버 상태, 로드된 엔진/백엔드 확인
+- `GET /presets` — 품질 preset + 사용 가능한 backend 확인
 - `POST /generate` — JSON 메타데이터 + 선택적 base64 응답
 - `POST /generate/raw` — PNG 바이너리 직접 응답
 - `GET /files/{file_id}` — 저장된 PNG 다운로드
@@ -191,14 +191,31 @@ FLUX 라이선스 동의 완료: https://huggingface.co/black-forest-labs/FLUX.1
 
 ### `POST /generate` 요청 예시
 
+기본 backend는 `studio`입니다.
+
 ```json
 {
+  "backend": "studio",
   "prompt": "a simple teal gradient background",
   "negative": "blurry, low quality, text, watermark",
   "quality": "draft",
   "width": 512,
   "height": 512,
   "filename": "teal-gradient.png",
+  "include_base64": false
+}
+```
+
+Codex backend를 쓰고 싶으면 이렇게 호출합니다.
+
+```json
+{
+  "backend": "codex",
+  "prompt": "a simple blue gradient background",
+  "quality": "draft",
+  "width": 512,
+  "height": 512,
+  "filename": "codex-api-blue-gradient.png",
   "include_base64": false
 }
 ```
@@ -210,6 +227,7 @@ FLUX 라이선스 동의 완료: https://huggingface.co/black-forest-labs/FLUX.1
   "ok": true,
   "elapsed_sec": 8.19,
   "meta": {
+    "backend": "studio",
     "engine": "turbo",
     "steps": 4,
     "width": 512,
@@ -232,10 +250,17 @@ FLUX 라이선스 동의 완료: https://huggingface.co/black-forest-labs/FLUX.1
 - 저장 경로 패턴:
   - `outputs/YYYY/MM/DD/<file_id>__<filename>.png`
 
+### backend 정책
+- `backend: "studio"` → 로컬 SDXL 엔진(`turbo`, `base`) 사용
+- `backend: "codex"` → Codex CLI 이미지 생성 사용
+- Codex backend는 생성 성공 후 최종 저장을 검증하고,
+  필요하면 임시 `ig_*.png` 결과를 복구해 저장
+
 ### 운영 메모
 - 생성은 MPS 안정성을 위해 직렬화됨
 - 동시 요청이 겹치면 빠르게 `503 generator busy`를 반환
 - `draft/turbo`는 빠른 초안용, `balanced/base` 이상은 시간이 오래 걸림
+- `backend: "codex"` 는 일반적으로 더 느리지만 프롬프트 해석이 다를 수 있음
 
 ## Codex CLI 향후 기능 (under development)
 

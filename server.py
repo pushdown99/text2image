@@ -17,19 +17,22 @@ import os
 import re
 import time
 import base64
+import shutil
 import secrets
 import threading
 import tempfile
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
+from PIL import Image
 import torch
 from diffusers import AutoPipelineForText2Image
 
-app = FastAPI(title='IMSenz AI Studio', version='0.4.0')
+app = FastAPI(title='IMSenz AI Studio', version='0.5.0')
 
 
 class Quality(str, Enum):
@@ -37,6 +40,11 @@ class Quality(str, Enum):
     balanced = 'balanced'
     hq       = 'hq'
     ultra    = 'ultra'
+
+
+class Backend(str, Enum):
+    studio = 'studio'
+    codex = 'codex'
 
 
 PRESETS = {
@@ -61,7 +69,11 @@ _pipes: dict[str, object] = {}
 _pipe_lock = threading.Lock()
 _gen_lock  = threading.Lock()
 GEN_LOCK_TIMEOUT_SEC = 0.25
-OUTPUTS_DIR = Path(__file__).resolve().parent / 'outputs'
+AI_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = AI_DIR.parent
+OUTPUTS_DIR = AI_DIR / 'outputs'
+CODEX_LOGS_DIR = OUTPUTS_DIR / '_codex_logs'
+CODEX_BIN_CANDIDATES = ['codex', '/opt/homebrew/bin/codex']
 
 
 def get_pipe(engine: str):
@@ -88,6 +100,7 @@ class GenRequest(BaseModel):
     prompt: str
     negative: str | None = None
     quality: Quality = Quality.balanced
+    backend: Backend = Backend.studio
     # Optional overrides (only set if you want to override the preset)
     steps: int | None = None
     width: int | None = None
@@ -148,6 +161,129 @@ def _find_file_by_id(file_id: str) -> Path:
     return matches[-1]
 
 
+def _find_codex_bin() -> str | None:
+    for candidate in CODEX_BIN_CANDIDATES:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _acquire_generation_lock():
+    acquired = _gen_lock.acquire(timeout=GEN_LOCK_TIMEOUT_SEC)
+    if not acquired:
+        raise HTTPException(
+            status_code=503,
+            detail='generator busy: another image request is already running; retry shortly'
+        )
+
+
+def _recover_codex_temp_output(target: Path, started_at: float) -> bool:
+    candidates = []
+    for path in Path('/var/folders').glob('*/*/*/T/ig_*.png'):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if stat.st_mtime >= started_at - 2 and stat.st_size > 0:
+            candidates.append((stat.st_mtime, path))
+
+    if not candidates:
+        return False
+
+    _, latest = max(candidates, key=lambda item: item[0])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(latest, target)
+    return target.exists() and target.stat().st_size > 0
+
+
+def _build_codex_prompt(req: GenRequest, target: Path) -> str:
+    size_hint = ''
+    if req.width and req.height:
+        size_hint = f' Aim for approximately {req.width}x{req.height} pixels composition/aspect ratio.'
+    negative_hint = f' Avoid: {req.negative}.' if req.negative else ''
+    quality_hint = {
+        Quality.draft: 'Prefer a quick draft output.',
+        Quality.balanced: 'Prefer balanced photorealistic quality.',
+        Quality.hq: 'Prefer high-detail photorealistic quality.',
+        Quality.ultra: 'Prefer the highest practical detail and realism.'
+    }[req.quality]
+    return (
+        f'Generate one image only. {req.prompt}. '
+        f'{quality_hint}{size_hint} {negative_hint} '
+        'Return a single raster image only, no collage, no grid, no multiple panels. '
+        f'Save the result to {target}.'
+    ).strip()
+
+
+def _generate_via_codex(req: GenRequest):
+    codex_bin = _find_codex_bin()
+    if codex_bin is None:
+        raise HTTPException(status_code=503, detail='codex CLI is not installed on this server')
+
+    file_id, public_name, target, relative = _build_managed_output_path(req.filename)
+    CODEX_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = CODEX_LOGS_DIR / f'{file_id}_last.txt'
+    prompt = _build_codex_prompt(req, target)
+
+    _acquire_generation_lock()
+    started_at = time.time()
+    codex_env = os.environ.copy()
+    codex_env['PATH'] = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:' + codex_env.get('PATH', '')
+
+    try:
+        proc = subprocess.run(
+            [
+                codex_bin, 'exec',
+                '--skip-git-repo-check',
+                '-C', str(WORKSPACE_DIR),
+                '--dangerously-bypass-approvals-and-sandbox',
+                prompt,
+                '-o', str(log_path),
+            ],
+            cwd=str(WORKSPACE_DIR),
+            env=codex_env,
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail='codex image generation timed out')
+    finally:
+        _gen_lock.release()
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or '').strip()[-1000:]
+        raise HTTPException(status_code=500, detail=f'codex generation failed: {detail or "unknown error"}')
+
+    if (not target.exists() or target.stat().st_size == 0) and not _recover_codex_temp_output(target, started_at):
+        raise HTTPException(status_code=500, detail=f'codex generated output but final save could not be verified; inspect {log_path}')
+
+    with Image.open(target) as opened:
+        img = opened.copy()
+
+    meta = {
+        'backend': req.backend.value,
+        'engine': 'codex',
+        'quality': req.quality.value,
+        'width': req.width,
+        'height': req.height,
+        'steps': None,
+        'guidance': None,
+        'log_path': str(log_path),
+    }
+    saved = {
+        'file_id': file_id,
+        'filename': public_name,
+        'relative_path': str(relative),
+        'absolute_path': str(target),
+        'bytes': target.stat().st_size,
+    }
+    return img, time.time() - started_at, meta, saved
+
+
 @app.get('/health')
 def health():
     return {
@@ -155,6 +291,8 @@ def health():
         'engines_loaded': list(_pipes.keys()),
         'device': 'mps',
         'outputs_dir': str(OUTPUTS_DIR.resolve()),
+        'backends': [b.value for b in Backend],
+        'codex_available': _find_codex_bin() is not None,
     }
 
 
@@ -171,10 +309,11 @@ def list_presets():
         'qualities': {q.value: PRESETS[q] for q in Quality},
         'default': Quality.balanced.value,
         'engines': list(ENGINE_IDS.keys()),
+        'backends': [b.value for b in Backend],
     }
 
 
-def _generate(req: GenRequest):
+def _generate_via_studio(req: GenRequest):
     preset = PRESETS[req.quality]
     engine  = preset['engine']
     steps   = req.steps    if req.steps    is not None else preset['steps']
@@ -182,7 +321,6 @@ def _generate(req: GenRequest):
     width   = req.width    if req.width    is not None else size
     height  = req.height   if req.height   is not None else size
     guidance= req.guidance if req.guidance is not None else preset['guidance']
-    # Turbo ignores negative prompt & prefers guidance 0
     negative = req.negative if req.negative is not None else (DEFAULT_NEG if engine == 'base' else None)
 
     pipe = get_pipe(engine)
@@ -190,14 +328,8 @@ def _generate(req: GenRequest):
     if req.seed is not None:
         generator = torch.Generator(device='mps').manual_seed(req.seed)
 
-    acquired = _gen_lock.acquire(timeout=GEN_LOCK_TIMEOUT_SEC)
-    if not acquired:
-        raise HTTPException(
-            status_code=503,
-            detail='generator busy: another image request is already running; retry shortly'
-        )
-
-    try:  # MPS: serialize generations, but fail fast instead of queueing forever
+    _acquire_generation_lock()
+    try:
         t0 = time.time()
         kwargs = {
             'prompt': req.prompt,
@@ -214,16 +346,28 @@ def _generate(req: GenRequest):
     finally:
         _gen_lock.release()
 
-    return out.images[0], elapsed, {
-        'engine': engine, 'steps': steps, 'width': width,
-        'height': height, 'guidance': guidance, 'quality': req.quality.value,
+    meta = {
+        'backend': req.backend.value,
+        'engine': engine,
+        'steps': steps,
+        'width': width,
+        'height': height,
+        'guidance': guidance,
+        'quality': req.quality.value,
     }
+    saved = _save_png_atomic(out.images[0], filename=req.filename)
+    return out.images[0], elapsed, meta, saved
+
+
+def _generate(req: GenRequest):
+    if req.backend == Backend.codex:
+        return _generate_via_codex(req)
+    return _generate_via_studio(req)
 
 
 @app.post('/generate')
 def generate(req: GenRequest, request: Request):
-    img, elapsed, meta = _generate(req)
-    saved = _save_png_atomic(img, filename=req.filename)
+    img, elapsed, meta, saved = _generate(req)
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     payload = {
@@ -243,16 +387,16 @@ def generate(req: GenRequest, request: Request):
 
 @app.post('/generate/raw')
 def generate_raw(req: GenRequest, request: Request):
-    img, elapsed, meta = _generate(req)
-    saved = _save_png_atomic(img, filename=req.filename)
+    img, elapsed, meta, saved = _generate(req)
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     headers = {
         'X-Elapsed-Sec': str(round(elapsed, 2)),
-        'X-Engine':  meta['engine'],
-        'X-Steps':   str(meta['steps']),
-        'X-Size':    f"{meta['width']}x{meta['height']}",
-        'X-Quality': meta['quality'],
+        'X-Backend': meta['backend'],
+        'X-Engine': str(meta['engine']),
+        'X-Steps': str(meta['steps']),
+        'X-Size': f"{meta['width']}x{meta['height']}",
+        'X-Quality': str(meta['quality']),
         'X-File-Id': saved['file_id'],
         'X-Filename': saved['filename'],
         'X-Relative-Path': saved['relative_path'],
